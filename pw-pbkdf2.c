@@ -1,7 +1,7 @@
 /* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 2009-2015 The OpenLDAP Foundation.
+ * Copyright 2009-2018 The OpenLDAP Foundation.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -19,7 +19,6 @@
 #define _GNU_SOURCE
 
 #include "portable.h"
-#include <slap.h>
 #include <ac/string.h>
 #include "lber_pvt.h"
 #include "lutil.h"
@@ -27,24 +26,17 @@
 #include <stdlib.h>
 
 #ifdef HAVE_OPENSSL
-#define PBKDF2_LIB "OpenSSL"
 #include <openssl/evp.h>
 #elif HAVE_GNUTLS
-#define PBKDF2_LIB "Nettle"
 #include <nettle/pbkdf2.h>
 #include <nettle/hmac.h>
 typedef void (*pbkdf2_hmac_update)(void *, unsigned, const uint8_t *);
 typedef void (*pbkdf2_hmac_digest)(void *, unsigned, uint8_t *);
-#elif HAVE_MOZNSS
-#define PBKDF2_LIB "MOZNSS"
-#include <nspr/plarena.h>
-#include </usr/include/nspr4/prtypes.h>
-#include <nss/pk11pub.h>
 #else
 #error Unsupported crypto backend.
 #endif
 
-static int pbkdf2_iteration = 10000;
+#define PBKDF2_ITERATION 30000
 #define PBKDF2_SALT_SIZE 16
 #define PBKDF2_SHA1_DK_SIZE 20
 #define PBKDF2_SHA256_DK_SIZE 32
@@ -156,7 +148,7 @@ static int pbkdf2_encrypt(
 	struct berval salt;
 	unsigned char dk_value[PBKDF2_MAX_DK_SIZE];
 	struct berval dk;
-	int iteration = pbkdf2_iteration;
+	int iteration = PBKDF2_ITERATION;
 	int rc;
 #ifdef HAVE_OPENSSL
 	const EVP_MD *md;
@@ -174,7 +166,10 @@ static int pbkdf2_encrypt(
 	dk.bv_val = (char *)dk_value;
 
 #ifdef HAVE_OPENSSL
-	if(!ber_bvcmp(scheme, &pbkdf2_scheme) || !ber_bvcmp(scheme, &pbkdf2_sha1_scheme)){
+	if(!ber_bvcmp(scheme, &pbkdf2_scheme)){
+		dk.bv_len = PBKDF2_SHA1_DK_SIZE;
+		md = EVP_sha1();
+	}else if(!ber_bvcmp(scheme, &pbkdf2_sha1_scheme)){
 		dk.bv_len = PBKDF2_SHA1_DK_SIZE;
 		md = EVP_sha1();
 	}else if(!ber_bvcmp(scheme, &pbkdf2_sha256_scheme)){
@@ -187,7 +182,13 @@ static int pbkdf2_encrypt(
 		return LUTIL_PASSWD_ERR;
 	}
 #elif HAVE_GNUTLS
-	if(!ber_bvcmp(scheme, &pbkdf2_scheme) || !ber_bvcmp(scheme, &pbkdf2_sha1_scheme)){
+	if(!ber_bvcmp(scheme, &pbkdf2_scheme)){
+		dk.bv_len = PBKDF2_SHA1_DK_SIZE;
+		current_ctx = &sha1_ctx;
+		current_hmac_update = (pbkdf2_hmac_update) &hmac_sha1_update;
+		current_hmac_digest = (pbkdf2_hmac_digest) &hmac_sha1_digest;
+		hmac_sha1_set_key(current_ctx, passwd->bv_len, (const uint8_t *) passwd->bv_val);
+	}else if(!ber_bvcmp(scheme, &pbkdf2_sha1_scheme)){
 		dk.bv_len = PBKDF2_SHA1_DK_SIZE;
 		current_ctx = &sha1_ctx;
 		current_hmac_update = (pbkdf2_hmac_update) &hmac_sha1_update;
@@ -208,16 +209,6 @@ static int pbkdf2_encrypt(
 	}else{
 		return LUTIL_PASSWD_ERR;
 	}
-#elif HAVE_MOZNSS
-	if(!ber_bvcmp(scheme, &pbkdf2_scheme) || !ber_bvcmp(scheme, &pbkdf2_sha1_scheme)){
-		 dk.bv_len = PBKDF2_SHA1_DK_SIZE;
-	}else if(!ber_bvcmp(scheme, &pbkdf2_sha256_scheme)){
-		dk.bv_len = PBKDF2_SHA256_DK_SIZE;
-	}else if(!ber_bvcmp(scheme, &pbkdf2_sha512_scheme)){
-		dk.bv_len = PBKDF2_SHA512_DK_SIZE;
-	}else{
-		return LUTIL_PASSWD_ERR;
-	}	
 #endif
 
 	if(lutil_entropy((unsigned char *)salt.bv_val, salt.bv_len) < 0){
@@ -235,131 +226,10 @@ static int pbkdf2_encrypt(
 						  dk.bv_len, iteration,
 						  salt.bv_len, (const uint8_t *) salt.bv_val,
 						  dk.bv_len, dk_value);
-#elif HAVE_MOZNSS
-	PK11SlotInfo *slot = NULL;
-	SECAlgorithmID * algid = NULL;
-	PRArenaPool *salt_arena;
-	PRArenaPool *pw_arena;
-	PRArenaPool *symkey_arena;
-	salt_arena = PORT_NewArena(DER_DEFAULT_CHUNKSIZE);
-	if (salt_arena == NULL)
-	{
-		fprintf(stderr,"error initializing salt_arena");
-		return LUTIL_PASSWD_ERR;
-	}
-	pw_arena = PORT_NewArena(DER_DEFAULT_CHUNKSIZE);
-	if (pw_arena == NULL)
-	{
-		fprintf(stderr,"error initializing pw_arena");
-		return LUTIL_PASSWD_ERR;
-	}
-	symkey_arena = PORT_NewArena(DER_DEFAULT_CHUNKSIZE);
-	if (symkey_arena == NULL)
-	{
-		fprintf(stderr,"error initializing symkey_arena");
-		return LUTIL_PASSWD_ERR;
-	}
-	SECItem salt_moz={ siBuffer, NULL, 0};
-	SECItem pwitem={ siBuffer, NULL, 0};
-	slot=PK11_GetBestSlot(SEC_OID_PKCS5_PBKDF2, NULL);
-	if (slot == NULL)
-	{
-		fprintf(stderr,"error initializing slot");
-		return LUTIL_PASSWD_ERR;             
-	}
-
-	if(!ber_bvcmp(scheme, &pbkdf2_scheme) || !ber_bvcmp(scheme, &pbkdf2_sha1_scheme)){
-		if (SECITEM_AllocItem(salt_arena, &salt_moz, (unsigned int) PBKDF2_SALT_SIZE) == NULL)
-		{
-			fprintf(stderr,"error initializing salt_moz");
-			return LUTIL_PASSWD_ERR;
-		}
-		salt_moz.data = memcpy(salt_moz.data , salt_value, PBKDF2_SALT_SIZE);
-		if (SECITEM_AllocItem(pw_arena, &pwitem, (unsigned int)passwd->bv_len) == NULL)
-		{
-			fprintf(stderr,"error initializing pw_item");
-			return LUTIL_PASSWD_ERR;
-		}
-		pwitem.data= memcpy(pwitem.data, passwd->bv_val, passwd->bv_len );
-		algid=PK11_CreatePBEV2AlgorithmID(SEC_OID_PKCS5_PBKDF2, SEC_OID_HMAC_SHA1, SEC_OID_HMAC_SHA1, PBKDF2_SHA1_DK_SIZE, iteration, &salt_moz);
-		PK11SymKey *key = NULL;
-		key=PK11_PBEKeyGen(slot, algid, &pwitem, 0, NULL);
-		SECStatus rv2 = PK11_ExtractKeyValue(key);
-		SECItem *symkey;
-		if (SECITEM_AllocItem(symkey_arena, symkey, PBKDF2_SHA1_DK_SIZE) == NULL)
-		{
-			fprintf(stderr,"error initializing symkey");
-			return LUTIL_PASSWD_ERR;
-		}
-		symkey=PK11_GetKeyData(key);
-		dk.bv_val=memcpy(dk.bv_val, symkey->data, symkey->len);
-		PK11_FreeSymKey(key);
-	}else if(!ber_bvcmp(scheme, &pbkdf2_sha256_scheme)){
-		if (SECITEM_AllocItem(salt_arena, &salt_moz, (unsigned int) PBKDF2_SALT_SIZE) == NULL)
-		{
-			fprintf(stderr,"error initializing salt_moz");
-			return LUTIL_PASSWD_ERR;
-		}
-		salt_moz.data = memcpy(salt_moz.data , salt_value, PBKDF2_SALT_SIZE);
-		if (SECITEM_AllocItem(pw_arena, &pwitem, (unsigned int)passwd->bv_len) == NULL)
-		{
-			fprintf(stderr,"error initializing pw_item");
-			return LUTIL_PASSWD_ERR;
-		}
-		pwitem.data= memcpy(pwitem.data, passwd->bv_val, passwd->bv_len );
-		algid=PK11_CreatePBEV2AlgorithmID(SEC_OID_PKCS5_PBKDF2, SEC_OID_HMAC_SHA256, SEC_OID_HMAC_SHA256, PBKDF2_SHA256_DK_SIZE, iteration, &salt_moz);
-		PK11SymKey *key = NULL;
-		key=PK11_PBEKeyGen(slot, algid, &pwitem, 0, NULL);
-		SECStatus rv2 = PK11_ExtractKeyValue(key);
-		SECItem *symkey;
-		if (SECITEM_AllocItem(symkey_arena, symkey, PBKDF2_SHA256_DK_SIZE) == NULL)
-		{
-			fprintf(stderr,"error initializing symkey");
-			return LUTIL_PASSWD_ERR;
-		}
-		symkey=PK11_GetKeyData(key);
-		dk.bv_val=memcpy(dk.bv_val, symkey->data, symkey->len);
-		PK11_FreeSymKey(key);
-	}else if(!ber_bvcmp(scheme, &pbkdf2_sha512_scheme)){
-		if (SECITEM_AllocItem(salt_arena, &salt_moz, (unsigned int) PBKDF2_SALT_SIZE) == NULL)
-		{
-			fprintf(stderr,"error initializing salt_moz");
-			return LUTIL_PASSWD_ERR;
-		}
-		salt_moz.data = memcpy(salt_moz.data , salt_value, PBKDF2_SALT_SIZE);
-		if (SECITEM_AllocItem(pw_arena, &pwitem, (unsigned int)passwd->bv_len) == NULL)
-		{
-			fprintf(stderr,"error initializing pw_item");
-			return LUTIL_PASSWD_ERR;
-		}
-		pwitem.data= memcpy(pwitem.data, passwd->bv_val, passwd->bv_len );
-		algid=PK11_CreatePBEV2AlgorithmID(SEC_OID_PKCS5_PBKDF2, SEC_OID_HMAC_SHA512, SEC_OID_HMAC_SHA512, PBKDF2_SHA512_DK_SIZE, iteration, &salt_moz);
-		PK11SymKey *key = NULL;
-		key=PK11_PBEKeyGen(slot, algid, &pwitem, 0, NULL);
-		SECStatus rv2 = PK11_ExtractKeyValue(key);
-		SECItem *symkey;
-		if (SECITEM_AllocItem(symkey_arena, symkey, PBKDF2_SHA512_DK_SIZE) == NULL)
-		{
-			fprintf(stderr,"error initializing symkey");
-			return LUTIL_PASSWD_ERR;
-		}
-		symkey=PK11_GetKeyData(key);
-		dk.bv_val=memcpy(dk.bv_val, symkey->data, symkey->len);
-		PK11_FreeSymKey(key);
-	}else{
-		return LUTIL_PASSWD_ERR;
-	}
-		
-
-		PK11_FreeSlot(slot);
-		PORT_FreeArena(salt_arena, PR_FALSE);
-		PORT_FreeArena(pw_arena, PR_FALSE);
-		PORT_FreeArena(symkey_arena, PR_FALSE);		
 #endif
 
 #ifdef SLAPD_PBKDF2_DEBUG
 	printf("Encrypt for %s\n", scheme->bv_val);
-	printf("  Library:\t%s\n", PBKDF2_LIB);
 	printf("  Password:\t%s\n", passwd->bv_val);
 
 	printf("  Salt:\t\t");
@@ -375,8 +245,8 @@ static int pbkdf2_encrypt(
 		printf("%02x", dk_value[i]);
 	}
 	printf("\n");
-
 #endif
+
 	rc = pbkdf2_format(scheme, iteration, &salt, &dk, msg);
 
 #ifdef SLAPD_PBKDF2_DEBUG
@@ -421,7 +291,10 @@ static int pbkdf2_check(
 #endif
 
 #ifdef HAVE_OPENSSL
-	if(!ber_bvcmp(scheme, &pbkdf2_scheme) || !ber_bvcmp(scheme, &pbkdf2_sha1_scheme)){
+	if(!ber_bvcmp(scheme, &pbkdf2_scheme)){
+		dk_len = PBKDF2_SHA1_DK_SIZE;
+		md = EVP_sha1();
+	}else if(!ber_bvcmp(scheme, &pbkdf2_sha1_scheme)){
 		dk_len = PBKDF2_SHA1_DK_SIZE;
 		md = EVP_sha1();
 	}else if(!ber_bvcmp(scheme, &pbkdf2_sha256_scheme)){
@@ -434,7 +307,13 @@ static int pbkdf2_check(
 		return LUTIL_PASSWD_ERR;
 	}
 #elif HAVE_GNUTLS
-	if(!ber_bvcmp(scheme, &pbkdf2_scheme) || !ber_bvcmp(scheme, &pbkdf2_sha1_scheme)){
+	if(!ber_bvcmp(scheme, &pbkdf2_scheme)){
+		dk_len = PBKDF2_SHA1_DK_SIZE;
+		current_ctx = &sha1_ctx;
+		current_hmac_update = (pbkdf2_hmac_update) &hmac_sha1_update;
+		current_hmac_digest = (pbkdf2_hmac_digest) &hmac_sha1_digest;
+		hmac_sha1_set_key(current_ctx, cred->bv_len, (const uint8_t *) cred->bv_val);
+	}else if(!ber_bvcmp(scheme, &pbkdf2_sha1_scheme)){
 		dk_len = PBKDF2_SHA1_DK_SIZE;
 		current_ctx = &sha1_ctx;
 		current_hmac_update = (pbkdf2_hmac_update) &hmac_sha1_update;
@@ -455,17 +334,7 @@ static int pbkdf2_check(
 	}else{
 		return LUTIL_PASSWD_ERR;
 	}
-#elif HAVE_MOZNSS
-	if(!ber_bvcmp(scheme, &pbkdf2_scheme) || !ber_bvcmp(scheme, &pbkdf2_sha1_scheme)){
-		dk_len = PBKDF2_SHA1_DK_SIZE;
-	}else if(!ber_bvcmp(scheme, &pbkdf2_sha256_scheme)){
-		dk_len = PBKDF2_SHA256_DK_SIZE;
-	}else if(!ber_bvcmp(scheme, &pbkdf2_sha512_scheme)){
-		dk_len = PBKDF2_SHA512_DK_SIZE;
-	}else{
-		return LUTIL_PASSWD_ERR;
-	}
-#endif 
+#endif
 
 	iteration = atoi(passwd->bv_val);
 	if(iteration < 1){
@@ -526,137 +395,15 @@ static int pbkdf2_check(
 						  dk_len, iteration,
 						  PBKDF2_SALT_SIZE, salt_value,
 						  dk_len, input_dk_value);
-
-#elif HAVE_MOZNSS
-	PK11SlotInfo *slot = NULL;
-	SECAlgorithmID * algid = NULL;
-	PRArenaPool *salt_arena;
-	PRArenaPool *pw_arena;
-	PRArenaPool *symkey_arena;
-	salt_arena = PORT_NewArena(DER_DEFAULT_CHUNKSIZE);
-	if (salt_arena == NULL)
-	{
-		fprintf(stderr,"error initializing salt_arena");
-		return LUTIL_PASSWD_ERR;
-	}
-	pw_arena = PORT_NewArena(DER_DEFAULT_CHUNKSIZE);
-	if (pw_arena == NULL)
-	{
-		fprintf(stderr,"error initializing pw_arena");
-		return LUTIL_PASSWD_ERR;
-	}
-	symkey_arena = PORT_NewArena(DER_DEFAULT_CHUNKSIZE);
-	if (symkey_arena == NULL)
-	{
-		fprintf(stderr,"error initializing symkey_arena");
-		return LUTIL_PASSWD_ERR;
-	}
-	SECItem salt_moz={ siBuffer, NULL, 0};
-	SECItem pwitem={ siBuffer, NULL, 0};
-	slot=PK11_GetBestSlot(SEC_OID_PKCS5_PBKDF2, NULL);
-	if (slot == NULL)
-	{
-		fprintf(stderr,"error initializing slot");
-		return LUTIL_PASSWD_ERR;
-	}
-
-	if(!ber_bvcmp(scheme, &pbkdf2_scheme) || !ber_bvcmp(scheme, &pbkdf2_sha1_scheme)){
-		if (SECITEM_AllocItem(salt_arena, &salt_moz, (unsigned int) PBKDF2_SALT_SIZE) == NULL)
-		{
-			fprintf(stderr,"error initializing salt_moz");
-			return LUTIL_PASSWD_ERR;
-		}
-		salt_moz.data = memcpy(salt_moz.data , salt_value, PBKDF2_SALT_SIZE);
-		if (SECITEM_AllocItem(pw_arena, &pwitem, (unsigned int)cred->bv_len) == NULL)
-		{
-			fprintf(stderr,"error initializing pw_item");
-			return LUTIL_PASSWD_ERR;
-		}
-		pwitem.data= memcpy(pwitem.data, cred->bv_val, cred->bv_len );
-		algid=PK11_CreatePBEV2AlgorithmID(SEC_OID_PKCS5_PBKDF2, SEC_OID_HMAC_SHA1, SEC_OID_HMAC_SHA1,PBKDF2_SHA1_DK_SIZE, iteration, &salt_moz);
-		PK11SymKey *key = NULL;
-		key=PK11_PBEKeyGen(slot, algid, &pwitem, 0, NULL);
-		SECStatus rv2 = PK11_ExtractKeyValue(key);
-		SECItem *symkey;
-		if (SECITEM_AllocItem(symkey_arena, symkey, PBKDF2_SHA1_DK_SIZE) == NULL)
-		{
-			fprintf(stderr,"error initializing symkey");
-			return LUTIL_PASSWD_ERR;
-		}
-		symkey=PK11_GetKeyData(key);
-		memcpy(input_dk_value, symkey->data, symkey->len);
-		PK11_FreeSymKey(key);
-	}else if(!ber_bvcmp(scheme, &pbkdf2_sha256_scheme)){
-		if (SECITEM_AllocItem(salt_arena, &salt_moz, (unsigned int) PBKDF2_SALT_SIZE) == NULL)
-		{
-			fprintf(stderr,"error initializing salt_moz");
-			return LUTIL_PASSWD_ERR;
-		} 
-		salt_moz.data = memcpy(salt_moz.data , salt_value, PBKDF2_SALT_SIZE);
-		if (SECITEM_AllocItem(pw_arena, &pwitem, (unsigned int)cred->bv_len) == NULL)
-		{
-			fprintf(stderr,"error initializing pw_item");
-			return LUTIL_PASSWD_ERR;
-		}
-		pwitem.data= memcpy(pwitem.data, cred->bv_val, cred->bv_len );
-		algid=PK11_CreatePBEV2AlgorithmID(SEC_OID_PKCS5_PBKDF2, SEC_OID_HMAC_SHA256, SEC_OID_HMAC_SHA256, PBKDF2_SHA256_DK_SIZE, iteration, &salt_moz);
-		PK11SymKey *key = NULL;
-		key=PK11_PBEKeyGen(slot, algid, &pwitem, 0, NULL);
-		SECStatus rv2 = PK11_ExtractKeyValue(key);
-		SECItem *symkey;
-		if (SECITEM_AllocItem(symkey_arena, symkey, PBKDF2_SHA256_DK_SIZE) == NULL)
-		{
-			fprintf(stderr,"error initializing symkey");
-			return LUTIL_PASSWD_ERR;
-		}
-		symkey=PK11_GetKeyData(key);
-		memcpy(input_dk_value, symkey->data, symkey->len);
-		PK11_FreeSymKey(key);
-	}else if(!ber_bvcmp(scheme, &pbkdf2_sha512_scheme)){
-		if (SECITEM_AllocItem(salt_arena, &salt_moz, (unsigned int) PBKDF2_SALT_SIZE) == NULL)
-		{
-			fprintf(stderr,"error initializing salt_moz");
-			return LUTIL_PASSWD_ERR;
-		}
-		salt_moz.data = memcpy(salt_moz.data , salt_value, PBKDF2_SALT_SIZE);
-		if (SECITEM_AllocItem(pw_arena, &pwitem, (unsigned int)cred->bv_len) == NULL)
-		{
-			fprintf(stderr,"error initializing pw_item");
-			return LUTIL_PASSWD_ERR;
-		}
-		pwitem.data= memcpy(pwitem.data, cred->bv_val, cred->bv_len );
-		algid=PK11_CreatePBEV2AlgorithmID(SEC_OID_PKCS5_PBKDF2, SEC_OID_HMAC_SHA512, SEC_OID_HMAC_SHA512, PBKDF2_SHA512_DK_SIZE, iteration, &salt_moz);
-		PK11SymKey *key = NULL;
-		key=PK11_PBEKeyGen(slot, algid, &pwitem, 0, NULL);
-		SECStatus rv2 = PK11_ExtractKeyValue(key);
-		SECItem *symkey;
-		if (SECITEM_AllocItem(symkey_arena, symkey, PBKDF2_SHA512_DK_SIZE) == NULL)
-		{
-			fprintf(stderr,"error initializing symkey");
-			return LUTIL_PASSWD_ERR;
-		}
-		symkey=PK11_GetKeyData(key);
-		memcpy(input_dk_value, symkey->data, symkey->len);
-		PK11_FreeSymKey(key);
-	}else{
-		return LUTIL_PASSWD_ERR;
-	}
-
-
-	PK11_FreeSlot(slot);
-	PORT_FreeArena(salt_arena, PR_FALSE);
-	PORT_FreeArena(pw_arena, PR_FALSE);
-	PORT_FreeArena(symkey_arena, PR_FALSE);
 #endif
 
 	rc = memcmp(dk_value, input_dk_value, dk_len);
-	
 #ifdef SLAPD_PBKDF2_DEBUG
 	printf("  Iteration:\t%d\n", iteration);
 	printf("  Base64 Salt:\t%s\n", salt_b64);
 	printf("  Base64 DK:\t%s\n", dk_b64);
-	printf("  Stored Salt:\t");
 	int i;
+	printf("  Stored Salt:\t");
 	for(i=0; i<PBKDF2_SALT_SIZE; i++){
 		printf("%02x", salt_value[i]);
 	}
@@ -680,23 +427,6 @@ static int pbkdf2_check(
 
 int init_module(int argc, char *argv[]) {
 	int rc;
-	char *env = getenv("PBKDF2_ITERATION");
-	SECStatus rv;
-	rv = NSS_NoDB_Init(".");
-	if (rv != SECSuccess)
-	{
-		fprintf(stderr, "NSS initialization failed (err %d)\n",
-		PR_GetError());
-		return LUTIL_PASSWD_ERR;
-	}
-	if(env){
-		pbkdf2_iteration = atoi(env);
-		if(pbkdf2_iteration < 1){
-			Debug( LDAP_DEBUG_ANY, "pbkdf2_iteration must be greater than 1.",
-				   NULL, NULL, NULL);
-			return -1;
-		}
-	}
 	rc = lutil_passwd_add((struct berval *)&pbkdf2_scheme,
 						  pbkdf2_check, pbkdf2_encrypt);
 	if(rc) return rc;
