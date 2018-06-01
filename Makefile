@@ -12,7 +12,7 @@ OPT = -g -O2 -Wall
 #DEFS = -DSLAPD_PBKDF2_DEBUG
 
 INCS = $(LDAP_INC)
-LIBS = $(LDAP_LIB)
+LIBS = $(LDAP_LIB) -lcrypto
 
 PROGRAMS = pw-pbkdf2.la
 LTVER = 0:0:0
@@ -46,4 +46,3 @@ install:	$(PROGRAMS)
 	for p in $(PROGRAMS) ; do \
 		$(LIBTOOL) --mode=install cp $$p $(DESTDIR)$(moduledir) ; \
 	done
-
