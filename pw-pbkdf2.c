@@ -36,8 +36,8 @@ typedef void (*pbkdf2_hmac_digest)(void *, unsigned, uint8_t *);
 #error Unsupported crypto backend.
 #endif
 
-#define PBKDF2_ITERATION 10000
-#define PBKDF2_SALT_SIZE 16
+#define PBKDF2_ITERATION 30000
+#define PBKDF2_SALT_SIZE 12
 #define PBKDF2_SHA1_DK_SIZE 20
 #define PBKDF2_SHA256_DK_SIZE 32
 #define PBKDF2_SHA512_DK_SIZE 64
